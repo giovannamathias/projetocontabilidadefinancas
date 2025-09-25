@@ -10,23 +10,38 @@ from itertools import combinations
 
 # ============ CONFIG ============
 TICKERS = ['PETR4.SA', 'VALE3.SA', 'ITUB4.SA']  # 3 empresas
+MARKET_TICKER = '^BVSP'  # Ibovespa (Yahoo Finance)
 HOJE = datetime.today().date()
 START = (HOJE - timedelta(days=365*4 + 20)).isoformat()
 END = HOJE.isoformat()
 ORCAMENTO_TOTAL = 100000.00
 MESES_ANO = 12
 
+RISK_FREE_ANNUAL = 0.10
+
+def rf_mensal(rf_a):
+    # converte anualmente para mensal por capitalização composta
+    return (1.0 + rf_a) ** (1.0 / MESES_ANO) - 1.0
+
 # ============ DOWNLOAD (Adj Close) ============
-print(f"Baixando dados de {TICKERS} entre {START} e {END}...")
-precos_d = yf.download(TICKERS, start=START, end=END, auto_adjust=True, progress=False)['Close']
+print(f"Baixando dados de {TICKERS} e do mercado ({MARKET_TICKER}) entre {START} e {END}...")
+precos_d = yf.download(TICKERS + [MARKET_TICKER], start=START, end=END,
+                       auto_adjust=True, progress=False)['Close']
+
+# Garantia de DataFrame
 if isinstance(precos_d, pd.Series):
     precos_d = precos_d.to_frame(name=TICKERS[0])
 
 precos_d = precos_d.dropna(how='all').sort_index()
-precos_d = precos_d.dropna(how='any')             # exige cotação de todos no dia
+# exige cotação de TODOS no dia (ativos + mercado)
+precos_d = precos_d.dropna(how='any')
 
 # AGREGA MENSAL: último preço ajustado de cada mês
 precos_m = precos_d.resample('M').last().dropna(how='any')
+
+# Separa colunas de ativos e mercado
+ativos_cols = [c for c in precos_m.columns if c in TICKERS]
+market_col = MARKET_TICKER
 
 # ============ FUNÇÕES MANUAIS ============
 def media(lst):
@@ -67,15 +82,30 @@ def retorno_acumulado(retornos):
 def fmt_pct(x, casas=2):  # para imprimir em %
     return f"{x*100:.{casas}f}%"
 
-# ============ RETORNOS MENSAIS & ESTATÍSTICAS ============
+def variancia(lst):
+    n = len(lst)
+    if n < 2:
+        return float('nan')
+    m = media(lst)
+    return sum((x - m) ** 2 for x in lst) / (n - 1)
+
+# ============ RETORNOS MENSAIS ============
 ret_mensal = {}      # ticker -> lista de retornos mensais
 estat = {}           # métricas por ativo
 
-for t in TICKERS:
+# Ativos
+for t in ativos_cols:
     serie = precos_m[t].tolist()
     r = retornos_mensais(serie)
     ret_mensal[t] = r
 
+# Mercado (Ibovespa)
+serie_m = precos_m[market_col].tolist()
+ret_mkt_m = retornos_mensais(serie_m)
+
+# ============ ESTATÍSTICAS (ATIVOS) ============
+for t in ativos_cols:
+    r = ret_mensal[t]
     mu_m = media(r)
     sd_m = desvio_padrao(r)
 
@@ -86,7 +116,7 @@ for t in TICKERS:
     ret_acum_4a = retorno_acumulado(r)
 
     estat[t] = {
-        'PrecoAtual': serie[-1],
+        'PrecoAtual': precos_m[t].iloc[-1],
         'RetornoMedio_m': mu_m,
         'DesvioPadrao_m': sd_m,
         'RetornoMedio_a': mu_a,
@@ -97,27 +127,63 @@ for t in TICKERS:
 
 resumo_ativos = pd.DataFrame(estat).T
 
+# ============ MERCADO: MÉDIAS ============
+mu_mkt_m = media(ret_mkt_m)
+mu_mkt_a = mu_mkt_m * MESES_ANO
+var_mkt_m = variancia(ret_mkt_m)
+
+# ============ BETAS (com Ibovespa) ============
+betas = {}
+for t in ativos_cols:
+    cov_im = covariancia(ret_mensal[t], ret_mkt_m)
+    beta = cov_im / var_mkt_m if not math.isnan(cov_im) and var_mkt_m not in (0.0, float('nan')) else float('nan')
+    betas[t] = beta
+
+betas_s = pd.Series(betas, name='Beta')
+
+# ============ CAPM ============
+rf_a = RISK_FREE_ANNUAL
+rf_m = rf_mensal(rf_a)
+
+# Prêmio de mercado (anual)
+market_premium_a = mu_mkt_a - rf_a
+
+capm_a = {}
+capm_m = {}
+for t in ativos_cols:
+    b = betas[t]
+    # CAPM anual e mensal
+    capm_a[t] = rf_a + b * market_premium_a if not math.isnan(b) else float('nan')
+    capm_m[t] = rf_m + b * (mu_mkt_m - rf_m) if not math.isnan(b) else float('nan')
+
+capm_df = pd.DataFrame({
+    'Beta': betas_s,
+    'CAPM_mensal': pd.Series(capm_m),
+    'CAPM_anual': pd.Series(capm_a)
+})
+
 # ============ MATRIZ DE CORRELAÇÃO (mensal) ============
-N = len(TICKERS)
-corr_matrix = pd.DataFrame(index=TICKERS, columns=TICKERS, dtype=float)
+N = len(ativos_cols)
+corr_matrix = pd.DataFrame(index=ativos_cols, columns=ativos_cols, dtype=float)
 for i in range(N):
     for j in range(N):
-        x = ret_mensal[TICKERS[i]]
-        y = ret_mensal[TICKERS[j]]
+        x = ret_mensal[ativos_cols[i]]
+        y = ret_mensal[ativos_cols[j]]
         corr_matrix.iloc[i, j] = 1.0 if i == j else correlacao(x, y)
 
 print("\n=== MATRIZ DE CORRELAÇÃO (mensal) ===")
 print(corr_matrix.round(4))
 
 # ---- Correlação 2 a 2 (lista de pares)
+from itertools import combinations
 print("\n=== CORRELAÇÃO 2 a 2 (mensal) ===")
-for a, b in combinations(TICKERS, 2):
+for a, b in combinations(ativos_cols, 2):
     rho = correlacao(ret_mensal[a], ret_mensal[b])
     print(f"{a}  x  {b}:  {rho:.3f}")
 
 # ============ DETALHES POR AÇÃO ============
 print("\n=== DETALHES POR AÇÃO (base MENSAL → anualizada) ===")
-for t in TICKERS:
+for t in ativos_cols:
     r = ret_mensal[t]
     n = len(r)
     mu_m = media(r)
@@ -141,7 +207,7 @@ for t in TICKERS:
     print(f"Retorno acumulado no período: {fmt_pct(ret_acum)}")
     print(f"Melhor mês: {fmt_pct(r_max)} | Pior mês: {fmt_pct(r_min)}")
 
-# ============ RANKINGS (opcionais pro relatório) ============
+# ============ RANKINGS ============
 print("\n=== RANKING — Retorno médio anual (maior → menor) ===")
 print(resumo_ativos['RetornoMedio_a'].sort_values(ascending=False).apply(lambda v: f"{v*100:.2f}%"))
 
@@ -150,27 +216,29 @@ print(resumo_ativos['CV_anual'].sort_values().apply(lambda v: f"{v:.3f}x"))
 
 # ============ CARTEIRA (pesos iguais) — métricas ANUAIS ============
 w = [1 / N] * N
-# retorno esperado anual: média ponderada das médias anuais
-mu_port_a = sum(w[i] * estat[TICKERS[i]]['RetornoMedio_a'] for i in range(N))
+mu_port_a = sum(w[i] * estat[ativos_cols[i]]['RetornoMedio_a'] for i in range(N))
 
 # variância anual: Σ_i Σ_j w_i w_j * (cov_mensal * 12)
 sig2_port_a = 0.0
 for i in range(N):
     for j in range(N):
-        cov_ij_m = covariancia(ret_mensal[TICKERS[i]], ret_mensal[TICKERS[j]])
+        cov_ij_m = covariancia(ret_mensal[ativos_cols[i]], ret_mkt_m if i == j and ativos_cols[i] == market_col else ret_mensal[ativos_cols[j]])
+        # OBS: para a carteira, precisamos cov entre ativos (não com mercado).
+        # Ajuste correto:
+        cov_ij_m = covariancia(ret_mensal[ativos_cols[i]], ret_mensal[ativos_cols[j]])
         cov_ij_a = cov_ij_m * MESES_ANO
         sig2_port_a += w[i] * w[j] * cov_ij_a
 sigma_port_a = math.sqrt(sig2_port_a)
 
 # ============ ALOCAÇÃO REAL ============
-ultimos_precos = precos_m.iloc[-1]
+ultimos_precos = precos_m[ativos_cols].iloc[-1]
 qtd = ((ORCAMENTO_TOTAL / N) // ultimos_precos).astype(int)  # inteiras
 investido = qtd * ultimos_precos
 total_invest = float(investido.sum())
 pesos_reais = (investido / total_invest)
 
 # retorno esperado anual com pesos reais
-mu_port_real_a = sum(pesos_reais[i] * estat[TICKERS[i]]['RetornoMedio_a'] for i in range(N))
+mu_port_real_a = sum(pesos_reais[i] * estat[ativos_cols[i]]['RetornoMedio_a'] for i in range(N))
 
 # ============ IMPRESSÕES (em %) ============
 def linha_aloc():
@@ -185,17 +253,32 @@ print(linha_aloc())
 print(f"\nTotal investido: R$ {total_invest:,.2f}".replace(',', 'X').replace('.', ',').replace('X', '.'))
 print(f"Retorno médio esperado (anual, pesos reais): {fmt_pct(mu_port_real_a)}")
 
-# ============ GRÁFICOS ============
+# ============ SAÍDAS CAPM ============
+print("\n=== MERCADO (Ibovespa) ===")
+print(f"Retorno médio do mercado (mensal): {fmt_pct(mu_mkt_m)}")
+print(f"Retorno médio do mercado (anual):  {fmt_pct(mu_mkt_a)}")
+print(f"RF mensal: {fmt_pct(rf_m)} | RF anual: {fmt_pct(rf_a)}")
+print(f"Prêmio de mercado (anual): {fmt_pct(market_premium_a)}")
+
+print("\n=== BETAS (em relação ao Ibovespa) ===")
+for t in ativos_cols:
+    print(f"{t}: beta = {betas[t]:.3f}")
+
+print("\n=== CAPM (esperado) ===")
+for t in ativos_cols:
+    print(f"{t}: CAPM mensal = {fmt_pct(capm_m[t])} | CAPM anual = {fmt_pct(capm_a[t])}")
+
+# ============ GRÁFICOS OPCIONAIS ============
 # 1) Preço normalizado MENSAL
 plt.figure(figsize=(10,5))
-(precos_m / precos_m.iloc[0]).plot(ax=plt.gca())
+(precos_m[ativos_cols] / precos_m[ativos_cols].iloc[0]).plot(ax=plt.gca())
 plt.title('Preço Normalizado (Mensal, t0 = 1.0)')
 plt.xlabel('Mês'); plt.ylabel('Índice (x vezes)')
 plt.legend(title='Ativos'); plt.tight_layout(); plt.show()
 
-# 2) Retorno acumulado
+# 2) Retorno acumulado (ativos)
 ret_acum_df = pd.DataFrame(
-    {t: [retorno_acumulado(ret_mensal[t][:i+1]) for i in range(len(ret_mensal[t]))] for t in TICKERS},
+    {t: [retorno_acumulado(ret_mensal[t][:i+1]) for i in range(len(ret_mensal[t]))] for t in ativos_cols},
     index=precos_m.index[1:]  # alinha com as datas dos retornos mensais
 )
 ret_acum_pct = ret_acum_df * 100
@@ -204,3 +287,9 @@ ret_acum_pct.plot(ax=plt.gca())
 plt.title('Retorno Acumulado (%) — Mensal (∏(1+R_m) - 1)')
 plt.xlabel('Mês'); plt.ylabel('Retorno acumulado (%)')
 plt.legend(title='Ativos'); plt.tight_layout(); plt.show()
+
+# 3) Barras de Beta
+plt.figure(figsize=(8,4))
+pd.Series(betas).sort_values().plot(kind='bar', ax=plt.gca())
+plt.title('Betas dos Ativos (referência: Ibovespa)')
+plt.ylabel('β'); plt.tight_layout(); plt.show()
