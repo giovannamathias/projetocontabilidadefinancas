@@ -268,6 +268,222 @@ print("\n=== CAPM (esperado) ===")
 for t in ativos_cols:
     print(f"{t}: CAPM mensal = {fmt_pct(capm_m[t])} | CAPM anual = {fmt_pct(capm_a[t])}")
 
+# ====================== INDICADORES FINANCEIROS (2021–2024) ======================
+# Requer: yfinance >= 0.2.x. Funciona melhor quando o Yahoo expõe os campos para o ticker.
+# Fallback: CSV manual caso algum dado não esteja disponível.
+
+import os
+
+ANOS_INDICADORES = [2021, 2022, 2023, 2024]
+
+# ---- Mapeamentos de chaves possíveis no Yahoo (variam por empresa/idioma) ----
+KEYS = {
+    "ativo_circulante": [
+        "Total Current Assets", "Current Assets", "Ativo Circulante"
+    ],
+    "passivo_circulante": [
+        "Total Current Liabilities", "Current Liabilities", "Passivo Circulante"
+    ],
+    "estoques": [
+        "Inventory", "Inventories", "Estoques"
+    ],
+    "fornecedores": [
+        "Accounts Payable", "Trade and Other Payables", "Fornecedores"
+    ],
+    "ativo_total": [
+        "Total Assets", "Ativo Total"
+    ],
+    "receita_liquida": [
+        "Total Revenue", "Revenue", "Receita Líquida"
+    ],
+    "cmv": [
+        "Cost Of Revenue", "Cost of Goods Sold", "COGS", "Custo das Mercadorias Vendidas", "Custo dos Produtos Vendidos"
+    ]
+}
+
+def _first_key_available(df, candidates):
+    for k in candidates:
+        if k in df.index:
+            return k
+    return None
+
+def _to_year(dt_like):
+    # yfinance usa colunas datadas (Timestamp). Pega o ano.
+    try:
+        return int(str(dt_like)[:4])
+    except:
+        return None
+
+def _extract_by_year(table, key_candidates, year):
+    """
+    table: DataFrame no padrão yfinance (linhas = contas, colunas = datas).
+    Retorna valor da conta no ANO informado (preferindo colunas do próprio ano; senão, a mais próxima anterior).
+    """
+    if table is None or table.empty:
+        return None
+
+    key = _first_key_available(table, key_candidates)
+    if not key:
+        return None
+
+    # Mapear colunas por ano
+    cols_by_year = {}
+    for c in table.columns:
+        y = _to_year(c)
+        if y:
+            cols_by_year[y] = c
+
+    if year in cols_by_year:
+        return float(table.loc[key, cols_by_year[year]])
+    else:
+        # pegar a coluna mais próxima anterior ao ano (ex.: usar 2023 se não houver 2024 ainda)
+        anos_disponiveis = sorted([y for y in cols_by_year.keys() if y <= year])
+        if anos_disponiveis:
+            return float(table.loc[key, cols_by_year[anos_disponiveis[-1]]])
+    return None
+
+def _try_fetch_from_yf(ticker, anos):
+    """
+    Tenta extrair dados do Yahoo para os anos pedidos.
+    Retorna um dict {ano: {campos...}}, podendo conter None.
+    """
+    data = {ano: {} for ano in anos}
+    try:
+        tk = yf.Ticker(ticker)
+        # balance_sheet e financials anuais
+        bs = tk.balance_sheet    # Balanço Patrimonial (Annual)
+        fin = tk.financials      # DRE (Annual)
+        # Alguns tickers disponibilizam 'yearly_...' nas versões novas:
+        # bs = tk.get_balance_sheet(freq="yearly")
+        # fin = tk.get_financials(freq="yearly")
+
+        for ano in anos:
+            ac = _extract_by_year(bs, KEYS["ativo_circulante"], ano)
+            pc = _extract_by_year(bs, KEYS["passivo_circulante"], ano)
+            est = _extract_by_year(bs, KEYS["estoques"], ano)
+            forn = _extract_by_year(bs, KEYS["fornecedores"], ano)
+            at = _extract_by_year(bs, KEYS["ativo_total"], ano)
+            rec = _extract_by_year(fin, KEYS["receita_liquida"], ano)
+            cmv = _extract_by_year(fin, KEYS["cmv"], ano)
+
+            data[ano] = {
+                "AtivoCirculante": ac,
+                "PassivoCirculante": pc,
+                "Estoques": est,
+                "Fornecedores": forn,
+                "AtivoTotal": at,
+                "ReceitaLiquida": rec,
+                "CMV": cmv
+            }
+    except Exception as e:
+        print(f"[{ticker}] Aviso: falha ao consultar yfinance ({e}).")
+    return data
+
+def _calc_indicadores(reg):
+    """
+    reg: dict com os campos numéricos.
+    Retorna dict com LC, LS, GA e PMP (dias).
+    """
+    ac = reg.get("AtivoCirculante")
+    pc = reg.get("PassivoCirculante")
+    est = reg.get("Estoques")
+    at = reg.get("AtivoTotal")
+    rec = reg.get("ReceitaLiquida")
+    cmv = reg.get("CMV")
+    forn = reg.get("Fornecedores")
+
+    def safe_div(num, den):
+        if num is None or den in (None, 0):
+            return None
+        return num / den
+
+    lc = safe_div(ac, pc)
+    ls = safe_div((ac - est) if (ac is not None and est is not None) else None, pc)
+    ga = safe_div(rec, at)
+    pmp = safe_div(forn * 360 if forn is not None else None, cmv)
+
+    return {
+        "LiquidezCorrente": lc,
+        "LiquidezSeca": ls,
+        "GiroAtivo": ga,
+        "PMP_dias": pmp
+    }
+
+# ---------- CSV de fallback (caso algum campo não venha do Yahoo) ----------
+# Template (um arquivo por projeto; você pode preencher ou complementar valores faltantes):
+CSV_TEMPLATE = "indicadores_input.csv"
+if not os.path.exists(CSV_TEMPLATE):
+    import pandas as pd
+    cols = ["Ticker","Ano","AtivoCirculante","PassivoCirculante","Estoques","Fornecedores","AtivoTotal","ReceitaLiquida","CMV"]
+    df_tmp = pd.DataFrame(columns=cols)
+    df_tmp.to_csv(CSV_TEMPLATE, index=False, encoding="utf-8")
+    print(f"\n[Template criado] Preencha valores faltantes em: {CSV_TEMPLATE}")
+    print("Colunas: Ticker,Ano,AtivoCirculante,PassivoCirculante,Estoques,Fornecedores,AtivoTotal,ReceitaLiquida,CMV\n")
+
+def _merge_with_csv(ticker, data_by_year, csv_path=CSV_TEMPLATE):
+    """
+    Se existir um CSV com valores preenchidos, ele sobrescreve/complete os dados do Yahoo.
+    """
+    if not os.path.exists(csv_path):
+        return data_by_year
+    try:
+        df_csv = pd.read_csv(csv_path)
+        df_csv = df_csv[df_csv["Ticker"].astype(str).str.upper() == str(ticker).upper()]
+        for _, row in df_csv.iterrows():
+            ano = int(row["Ano"])
+            if ano in data_by_year:
+                for col in ["AtivoCirculante","PassivoCirculante","Estoques","Fornecedores","AtivoTotal","ReceitaLiquida","CMV"]:
+                    val = row.get(col, None)
+                    if pd.notnull(val):
+                        data_by_year[ano][col] = float(val)
+    except Exception as e:
+        print(f"[{ticker}] Aviso ao ler CSV fallback: {e}")
+    return data_by_year
+
+# ----------------- Execução por ticker: calcula e agrega numa tabela -----------------
+linhas = []
+for t in ativos_cols:
+    print(f"\n[INDICADORES] Coletando dados contábeis para {t} (anos: {ANOS_INDICADORES})...")
+    dados = _try_fetch_from_yf(t, ANOS_INDICADORES)
+    dados = _merge_with_csv(t, dados, CSV_TEMPLATE)
+
+    for ano in ANOS_INDICADORES:
+        reg = dados.get(ano, {})
+        inds = _calc_indicadores(reg)
+        linhas.append({
+            "Ticker": t,
+            "Ano": ano,
+            "Liquidez Corrente": inds["LiquidezCorrente"],
+            "Liquidez Seca": inds["LiquidezSeca"],
+            "Giro do Ativo": inds["GiroAtivo"],
+            "PMP (dias)": inds["PMP_dias"]
+        })
+
+indicadores_df = pd.DataFrame(linhas)
+# Ordena por Ticker e Ano
+try:
+    indicadores_df = indicadores_df.sort_values(by=["Ticker","Ano"]).reset_index(drop=True)
+except Exception:
+    pass
+
+print("\n=== INDICADORES FINANCEIROS (2021–2024) ===")
+print(indicadores_df.to_string(index=False, float_format=lambda v: f"{v:.2f}" if pd.notnull(v) else "NA"))
+
+# Salva CSV final
+OUT_CSV = "indicadores_2021_2024.csv"
+indicadores_df.to_csv(OUT_CSV, index=False, encoding="utf-8")
+print(f"\n[OK] Tabela salva em: {OUT_CSV}")
+
+# (Opcional) Tabela por empresa (pivot) para visual mais rápido:
+try:
+    piv = indicadores_df.pivot_table(index=["Ticker","Ano"],
+                                     values=["Liquidez Corrente","Liquidez Seca","Giro do Ativo","PMP (dias)"],
+                                     aggfunc="first")
+    print("\n=== VISÃO PIVOT ===")
+    print(piv)
+except Exception:
+    pass
+
 # ============ GRÁFICOS OPCIONAIS ============
 # 1) Preço normalizado MENSAL
 plt.figure(figsize=(10,5))
@@ -293,3 +509,67 @@ plt.figure(figsize=(8,4))
 pd.Series(betas).sort_values().plot(kind='bar', ax=plt.gca())
 plt.title('Betas dos Ativos (referência: Ibovespa)')
 plt.ylabel('β'); plt.tight_layout(); plt.show()
+
+# ====================== GRÁFICOS DOS INDICADORES (2021–2024) ======================
+import os
+
+# garante que temos o CSV calculado na etapa anterior
+INDIC_CSV = "indicadores_2021_2024.csv"
+if not os.path.exists(INDIC_CSV):
+    print(f"[Aviso] Arquivo {INDIC_CSV} não encontrado. Gere os indicadores antes desta etapa.")
+else:
+    df_ind = pd.read_csv(INDIC_CSV)
+
+    # limpa/ordena
+    df_ind = df_ind.dropna(subset=["Ano"]).copy()
+    df_ind["Ano"] = df_ind["Ano"].astype(int)
+    df_ind = df_ind.sort_values(["Ticker", "Ano"])
+
+    # pasta de saída
+    outdir = "graficos"
+    os.makedirs(outdir, exist_ok=True)
+
+    indicadores = ["Liquidez Corrente", "Liquidez Seca", "Giro do Ativo", "PMP (dias)"]
+
+    # 1) Séries temporais por indicador (linhas por ticker)
+    for ind in indicadores:
+        try:
+            piv = df_ind.pivot(index="Ano", columns="Ticker", values=ind).sort_index()
+            ax = piv.plot(marker="o", figsize=(9, 5))
+            ax.set_title(f"{ind} — (2021–2024)")
+            ax.set_xlabel("Ano")
+            ax.set_ylabel(ind)
+            ax.grid(True, linestyle="--", alpha=0.4)
+            ax.legend(title="Ticker", frameon=False)
+            plt.tight_layout()
+            fname = os.path.join(outdir, f"{ind.replace(' ', '_').replace('(', '').replace(')', '').replace('/', '-')}_serie.png")
+            plt.savefig(fname, dpi=160)
+            plt.show()
+            print(f"[OK] Gráfico salvo: {fname}")
+        except Exception as e:
+            print(f"[Aviso] Não foi possível plotar '{ind}': {e}")
+
+    # 2) Comparativo do ÚLTIMO ANO disponível (barras por ticker)
+    try:
+        ultimo_ano = int(df_ind["Ano"].max())
+        base_ultimo = df_ind[df_ind["Ano"] == ultimo_ano].copy()
+
+        # barras lado a lado: 1 figura por indicador
+        for ind in indicadores:
+            sub = base_ultimo[["Ticker", ind]].set_index("Ticker").sort_index()
+            ax = sub.plot(kind="bar", figsize=(9, 5))
+            ax.set_title(f"{ind} — Comparativo ({ultimo_ano})")
+            ax.set_xlabel("Ticker")
+            ax.set_ylabel(ind)
+            ax.grid(axis="y", linestyle="--", alpha=0.4)
+            ax.legend().remove()
+            plt.tight_layout()
+            fname = os.path.join(outdir, f"{ind.replace(' ', '_').replace('(', '').replace(')', '').replace('/', '-')}_comparativo_{ultimo_ano}.png")
+            plt.savefig(fname, dpi=160)
+            plt.show()
+            print(f"[OK] Gráfico salvo: {fname}")
+    except Exception as e:
+        print(f"[Aviso] Não foi possível gerar comparativos do último ano: {e}")
+
+
+
